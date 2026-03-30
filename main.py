@@ -36,6 +36,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr, field_validator
 
 from gemini_live import GeminiLive
+from mcp_client import get_shared_mcp_client
 
 # ─── Environment ─────────────────────────────────────────────────────────────────
 load_dotenv()
@@ -255,6 +256,11 @@ async def on_startup():
 async def on_shutdown():
     mongo_client.close()
     logger.info("MongoDB connection closed")
+    # Cleanly shut down the MCP server subprocess if it was started
+    from mcp_client import _shared as _mcp_shared
+    if _mcp_shared and _mcp_shared.is_connected():
+        await _mcp_shared.disconnect()
+        logger.info("MCP client disconnected")
 
 
 # ─── Health check ─────────────────────────────────────────────────────────────────
@@ -418,6 +424,25 @@ def _build_system_instruction(agent: dict) -> str:
             f"- Keep responses short, natural, and conversational."
         )
 
+    # ── MCP / Database tool instructions ─────────────────────────────────────
+    base += (
+        "\n\n"
+        "DATABASE ACCESS:\n"
+        "You have access to the VoiceBridge database through the following tools:\n"
+        "- get_user_profile: Use when the user asks about their account, name, email, "
+        "or when they joined. The user_id is automatically provided — never ask for it.\n"
+        "- list_user_agents: Use when the user asks how many agents they have, or "
+        "wants to see their list of voice agents.\n"
+        "- count_user_agents: Use for quick numeric questions like 'How many agents do I have?'\n"
+        "- get_agent_details: Use when the user asks about a specific agent by name or ID.\n"
+        "- list_collections: Use to discover what data categories exist in the database.\n"
+        "- query_collection: Use for any other read-only database query.\n"
+        "\n"
+        "IMPORTANT: When you use a tool, wait for the result, then give the user a "
+        "natural spoken answer based on that result. Never expose raw JSON — always "
+        "summarize the data in a friendly, conversational way."
+    )
+
     if custom:
         base += f"\n\nAdditional instructions from the user: {custom}"
 
@@ -473,13 +498,33 @@ async def websocket_endpoint(
     system_instruction = _build_system_instruction(agent)
     voice              = agent.get("voice", "Puck")
 
+    # ── MCP Tool Discovery ────────────────────────────────────────────────────────
+    # Connect to the running MCP DB server and fetch all available database tools.
+    # The user_id is pre-injected into every tool call for security — the LLM
+    # cannot request data belonging to any other user.
+    gemini_tools = []
+    tool_mapping  = {}
+    try:
+        mcp = await get_shared_mcp_client()
+        gemini_tools = await mcp.get_gemini_tools()
+        tool_mapping  = await mcp.get_tool_mapping(
+            injected_context={"user_id": user_id}
+        )
+        logger.info(f"MCP tools loaded › {list(tool_mapping.keys())}")
+    except Exception as mcp_err:
+        # MCP is optional — agent still works without DB tools if server is down
+        logger.warning(f"MCP server unavailable — running without DB tools: {mcp_err}")
+
     gemini_client = GeminiLive(
         api_key=GEMINI_API_KEY,
         model=MODEL,
         input_sample_rate=16000,
         voice_name=voice,
         system_instruction=system_instruction,
+        tools=gemini_tools,
+        tool_mapping=tool_mapping,
     )
+
 
     # ── Receive loop (client → server) ────────────────────────────────────────────
     async def receive_from_client():
