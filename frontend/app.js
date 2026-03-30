@@ -3,7 +3,7 @@
    ───────────────────────────────────────────────────────────── */
 
 // ── Constants ──────────────────────────────────────────────────
-const API_BASE = '';
+const API_BASE = 'http://localhost:8000';
 const TOKEN_KEY  = 'vb_token';
 const USER_KEY   = 'vb_user';
 
